@@ -5,6 +5,15 @@
 !.yarn/sdks
 !.yarn/versions
 
+# Dependencies and build
+node_modules
+dist
+
+# Environment variables
+.env
+.env.*
+!.env.example
+
 # Whether you use PnP or not, the node_modules folder is often used to store
 # build artifacts that should be gitignored
 node_modules
