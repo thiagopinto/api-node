@@ -5,34 +5,35 @@ import {
   getInFlightCount,
 } from "./middlewares/inFlight";
 import { redisClient } from "./infra/redis";
+import { PanicService } from "./services/panicService";
 import {
-  setupPanicButton,
+  setupPanicConsumer,
   panicMiddleware,
-  getPanicState,
-  getGlobalPanicState,
-  setGlobalPanicState,
-} from "./middlewares/panicButton";
+  getPanicLocalState,
+} from "./middlewares/panicMiddleware";
 
 const app = express();
 const PORT = process.env.PORT || 3000;
 
-// Middleware session
-app.use(express.json()); // Enable JSON body parsing
+// Instância do Service de Gestão do Pânico
+const panicService = new PanicService(redisClient);
+
+// Middlewares globais
+app.use(express.json());
 app.use(inFlightMiddleware);
 
-// Router session
-
-// 1. Rota raiz / healthcheck público (sempre responde)
+// ==========================================
+// 1. ROTAS GERAIS / HEALTHCHECK
+// ==========================================
 app.get("/", (req: Request, res: Response) => {
   res.json({
     message: "API Node.js com Express e TypeScript está ATIVA!",
     inFlightRequests: getInFlightCount(),
-    panicModeActive: getPanicState(),
+    localPanicState: getPanicLocalState(),
     timestamp: new Date().toISOString(),
   });
 });
 
-// 2. Rota de teste lenta (para testes de graceful shutdown)
 app.get("/slow", async (req: Request, res: Response) => {
   console.log("👉 Requisição /slow recebida. Processando por 5 segundos...");
   await new Promise((resolve) => setTimeout(resolve, 5000));
@@ -40,7 +41,9 @@ app.get("/slow", async (req: Request, res: Response) => {
   res.json({ message: "Processamento lento finalizado com sucesso!" });
 });
 
-// 3. Rota crítica protegida pelo BOTÃO DO PÂNICO
+// ==========================================
+// 2. ROTA PROTEGIDA (CONSUMIDOR DO PÂNICO)
+// ==========================================
 app.get("/checkout", panicMiddleware, (req: Request, res: Response) => {
   res.json({
     message: "Transação de checkout concluída com sucesso!",
@@ -49,57 +52,68 @@ app.get("/checkout", panicMiddleware, (req: Request, res: Response) => {
 });
 
 // ==========================================
-// PAINEL ADMINISTRATIVO DO BOTÃO DO PÂNICO
+// 3. ROTAS DE GESTÃO (CONTROL PLANE)
 // ==========================================
 
-// Consulta o status do pânico (local desta instância e global no Redis)
+// Consulta o status (local da instância e global do cluster via PanicService)
 app.get("/admin/panic", async (req: Request, res: Response) => {
   try {
-    const globalState = await getGlobalPanicState(redisClient);
+    const globalState = await panicService.getGlobalStatus();
     res.json({
-      localPanicState: getPanicState(),
+      localPanicState: getPanicLocalState(),
       globalPanicState: globalState,
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    res.status(500).json({ error: "Erro ao consultar estado global do Redis" });
+    res.status(500).json({ error: "Erro ao consultar status global no Redis" });
   }
 });
 
-// Ativa ou desativa o pânico globalmente para TODOS os microserviços
+// Ativa ou Desativa o pânico de forma ATÔMICA via PanicService
 app.post("/admin/panic", async (req: Request, res: Response) => {
   const { active } = req.body;
   if (typeof active !== "boolean") {
     return res.status(400).json({
       error: "Bad Request",
-      message: "Envie um JSON com { \"active\": true } ou { \"active\": false }",
+      message: "Envie um corpo JSON com { \"active\": true } ou { \"active\": false }",
     });
   }
 
   try {
-    const subscribersNotified = await setGlobalPanicState(redisClient, active);
+    const result = await panicService.setGlobalStatus(active);
     res.json({
       success: true,
-      panicActive: active,
-      subscribersNotified,
-      message: active
-        ? "🚨 Botão de pânico ATIVADO para todos os microserviços!"
-        : "🟢 Botão de pânico DESATIVADO para todos os microserviços!",
+      panicActive: result.active,
+      subscribersNotified: result.subscribersNotified,
+      message: result.active
+        ? "🚨 Pânico ATIVADO atomicamente no Redis e publicado para os microsserviços!"
+        : "🟢 Pânico DESATIVADO atomicamente no Redis e publicado para os microsserviços!",
       timestamp: new Date().toISOString(),
     });
   } catch (error) {
-    res.status(500).json({ error: "Erro ao atualizar estado de pânico no Redis" });
+    const msg = error instanceof Error ? error.message : "Erro desconhecido";
+    res.status(500).json({ error: "Falha na transação atômica do pânico", details: msg });
   }
 });
 
-// Start session
-const server = app.listen(PORT, async () => {
-  console.log(`🚀 Service start in http://localhost:${PORT}`);
+// ==========================================
+// BOOTSTRAP ORQUESTRADO
+// ==========================================
+async function bootstrap() {
   try {
-    await setupPanicButton(redisClient);
+    // 1. O Consumidor sincroniza o Boot com o Redis antes de abrir as portas
+    await setupPanicConsumer(redisClient, panicService);
   } catch (err) {
-    console.error("Falha ao inicializar subscriber do pânico:", err);
+    console.error("Falha ao inicializar o consumidor do pânico:", err);
   }
-});
 
-setupGracefulShutdown(server);
+  // 2. Somente após a sincronização, o servidor HTTP começa a aceitar tráfego
+  const server = app.listen(PORT, () => {
+    console.log(`🚀 Servidor rodando em http://localhost:${PORT}`);
+  });
+
+  // 3. Graceful shutdown com monitoramento de requisições em voo
+  setupGracefulShutdown(server);
+}
+
+bootstrap();
