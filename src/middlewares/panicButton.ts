@@ -2,7 +2,9 @@ import { type Request, type Response, type NextFunction } from "express";
 import { type Redis } from "ioredis";
 
 // Estado em memória local (consulta imediata em 0ms)
-let isPanicActive = false;
+// Default: true (bloqueado) para evitar race condition na inicialização
+// Só desbloqueia após verificar o valor no Redis
+let isPanicActive = true;
 let subscriberClient: Redis | null = null;
 
 export const PANIC_CHANNEL = "channel_panic";
@@ -39,17 +41,26 @@ export async function setupPanicButton(redis: Redis, useDuplicate: boolean = tru
 
   // 2. Sincronização inicial: lê a chave persistida no Redis
   // Caso o pânico já tenha sido acionado antes deste microserviço iniciar
+  // OBS: Começa bloqueado (isPanicActive = true) para evitar race condition
   try {
     const currentState = await redis.get(PANIC_REDIS_KEY);
     if (currentState === "true" || currentState === "1") {
       isPanicActive = true;
       console.log(`⚠️ Estado global recuperado do Redis: PÂNICO ATIVO`);
-    } else {
+    } else if (currentState === "false" || currentState === "0") {
       isPanicActive = false;
       console.log(`✅ Estado global recuperado do Redis: PÂNICO INATIVO`);
+    } else {
+      // Chave não existe no Redis → é a primeira inicialização
+      // Define como desbloqueado no Redis
+      await redis.set(PANIC_REDIS_KEY, "false");
+      isPanicActive = false;
+      console.log(`✅ Primeira inicialização: PÂNICO INATIVO (valor persistido no Redis)`);
     }
   } catch (error) {
     console.error("Erro ao sincronizar estado inicial do pânico do Redis:", error);
+    // Em caso de erro, mantém bloqueado por segurança (fail-safe)
+    isPanicActive = true;
   }
 }
 

@@ -1,18 +1,35 @@
 import "dotenv/config";
-import { redisClient } from "../src/infra/redis";
 
-const message = process.argv[2] ?? "true";
-const channel = "channel_panic";
+const API_URL = process.env.API_URL || "http://localhost:3000";
+const action = process.argv[2] ?? "true";
 
 async function main() {
-  console.log(`📡 Publicando no canal Redis "${channel}": "${message}"...`);
-  const receivers = await redisClient.publish(channel, message);
-  console.log(`✅ Mensagem entregue para ${receivers} assinante(s)!`);
-  await redisClient.quit();
+  const active = action === "true" || action === "on" || action === "1";
+  
+  console.log(`📡 Enviando requisição para ${API_URL}/admin/panic (active: ${active})...`);
+  
+  try {
+    const response = await fetch(`${API_URL}/admin/panic`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ active }),
+    });
+    
+    const data = await response.json();
+    
+    if (data.success) {
+      console.log(`✅ ${data.message}`);
+      console.log(`✅ Subscribers notificados: ${data.subscribersNotified}`);
+    } else {
+      console.error(`❌ Erro: ${data.error}`);
+      process.exit(1);
+    }
+  } catch (error) {
+    console.error("❌ Erro ao publicar:", (error as Error).message);
+    process.exit(1);
+  }
+  
   process.exit(0);
 }
 
-main().catch((err) => {
-  console.error("🔴 Erro ao publicar mensagem:", err);
-  process.exit(1);
-});
+main();
